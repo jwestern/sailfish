@@ -11,9 +11,16 @@ DESCRIPTION:
 // ============================ PHYSICS =======================================
 // ============================================================================
 #define NCONS 4
-#define PLM_THETA 2.0
 #define ADIABATIC_GAMMA (4.0 / 3.0)
 #define PI 3.141592653589793
+
+#ifndef RIEMANN_SOLVER
+#define RIEMANN_SOLVER 1 // 0=HLLE 1=HLLC
+#endif
+
+#ifndef PLM_THETA
+#define PLM_THETA 1.5
+#endif
 
 
 // ============================ MATH ==========================================
@@ -56,16 +63,6 @@ PRIVATE double primitive_to_lorentz_factor(const double *prim)
     return sqrt(1.0 + primitive_to_gamma_beta_squared(prim));
 }
 
-// PRIVATE double primitive_to_gamma_beta_component(const double *prim, int direction)
-// {
-//     switch (direction)
-//     {
-//         case 1: return prim[1];
-//         case 2: return prim[2];
-//     }
-//     return 0.0;
-// }
-
 PRIVATE double primitive_to_beta_component(const double *prim, int direction)
 {
     const double w = primitive_to_lorentz_factor(prim);
@@ -103,15 +100,15 @@ PRIVATE void primitive_to_conserved(const double *prim, double *cons, double dv)
     // cons[4] = dv * m * prim[3];
 }
 
-PRIVATE void conserved_to_primitive(double *cons, double *prim, double dv, double x, double q)
+PRIVATE void conserved_to_primitive(double *cons1, double *cons2, double *prim, double dv, double x, double q)
 {
     const double newton_iter_max = 500;
-    const double error_tolerance = 1e-12 * (cons[0] + cons[3]) / dv;
+    const double error_tolerance = 1e-12 * (cons1[0] + cons1[3]) / dv;
     const double gm              = ADIABATIC_GAMMA;
-    const double m               = cons[0] / dv;
-    const double tau             = cons[3] / dv;
-    const double s1              = cons[1] / dv;
-    const double s2              = cons[2] / dv;
+    const double m               = cons1[0] / dv;
+    const double tau             = cons1[3] / dv;
+    const double s1              = cons1[1] / dv;
+    const double s2              = cons1[2] / dv;
     const double ss              = s1 * s1 + s2 * s2;
     int iteration                = 0;
     double p                     = prim[3];
@@ -143,7 +140,7 @@ PRIVATE void conserved_to_primitive(double *cons, double *prim, double dv, doubl
     prim[1] = w0 * s1 / (tau + m + p);
     prim[2] = w0 * s2 / (tau + m + p);
     prim[3] = p;
-    // prim[4] = cons[4] / cons[0];
+    // prim[4] = cons1[4] / cons1[0];
 
     double mach_ceiling = 1e6;
     double u_squared = prim[1] * prim[1] + prim[2] * prim[2];
@@ -152,7 +149,12 @@ PRIVATE void conserved_to_primitive(double *cons, double *prim, double dv, doubl
 
     if (e < emin) {
         prim[3] = prim[0] * emin * (ADIABATIC_GAMMA - 1.0);
-        // primitive_to_conserved(prim, cons, dv);
+        primitive_to_conserved(prim, cons2, dv);
+    }
+    else {
+        for (int q = 0; q < NCONS; ++q) {
+            cons2[q] = cons1[q];
+        }
     }
 
     #if (EXEC_MODE != EXEC_GPU)
@@ -160,13 +162,13 @@ PRIVATE void conserved_to_primitive(double *cons, double *prim, double dv, doubl
         printf(
             "[FATAL] srhd_2d_conserved_to_primitive reached max "
             "iteration at comoving position (%.3f %.3f) "
-            "cons = [%.3e %.3e %.3e %.3e] error = %.3e\n", x, q, cons[0], cons[1], cons[2], cons[3], f);
+            "cons1 = [%.3e %.3e %.3e %.3e] error = %.3e\n", x, q, cons1[0], cons1[1], cons1[2], cons1[3], f);
         exit(1);
     }
-    if (cons[3] <= 0.0) {
+    if (cons1[3] <= 0.0) {
         printf(
             "[FATAL] srhd_2d_conserved_to_primitive found non-positive "
-            "or NaN total energy tau=%.5e at comoving position (%.3f %.3f)\n", cons[3], x, q);
+            "or NaN total energy tau=%.5e at comoving position (%.3f %.3f)\n", cons1[3], x, q);
         exit(1);
     }
     if (prim[3] <= 0.0 || prim[3] != prim[3]) {
@@ -224,6 +226,7 @@ PRIVATE void primitive_with_radial_boost(const double *prim, double *prim_booste
     prim_boosted[3] = prim[3];
 }
 
+#if (RIEMANN_SOLVER == 0)
 PRIVATE void riemann_hlle(const double *pl, const double *pr, double v_face, double *flux, int direction)
 {
     double ul[NCONS];
@@ -267,7 +270,154 @@ PRIVATE void riemann_hlle(const double *pl, const double *pr, double v_face, dou
         }
     }
 }
+#endif
 
+#if (RIEMANN_SOLVER == 1)
+PRIVATE void riemann_hllc(const double *pl, const double *pr, double v_face, double *flux, int direction)
+{
+    double ul[NCONS];
+    double ur[NCONS];
+    double fl[NCONS];
+    double fr[NCONS];
+    double u_hll[NCONS];
+    double f_hll[NCONS];
+    double al[2];
+    double ar[2];
+
+    primitive_to_conserved(pl, ul, 1.0);
+    primitive_to_conserved(pr, ur, 1.0);
+    primitive_to_flux(pl, ul, fl, direction);
+    primitive_to_flux(pr, ur, fr, direction);
+    primitive_to_outer_wavespeeds(pl, al, direction);
+    primitive_to_outer_wavespeeds(pr, ar, direction);
+
+    const double am = min2(al[0], ar[0]);
+    const double ap = max2(al[1], ar[1]);
+
+    if (v_face < am)
+    {
+        for (int q = 0; q < NCONS; ++q)
+        {
+            flux[q] = fl[q] - v_face * ul[q];
+        }
+    }
+    else if (v_face > ap)
+    {
+        for (int q = 0; q < NCONS; ++q)
+        {
+            flux[q] = fr[q] - v_face * ur[q];
+        }
+    }
+    else
+    {    
+        double D_star;
+        double S1_star;
+        double S2_star;
+        double E_star; // total energy E = tau + D
+        double tau_star;
+
+        for (int q = 0; q < NCONS; ++q)
+        {
+            u_hll[q] = (ur[q] * ap - ul[q] * am + (fl[q] - fr[q]))           / (ap - am);
+            f_hll[q] = (fl[q] * ap - fr[q] * am - (ul[q] - ur[q]) * ap * am) / (ap - am);
+        }
+        double uhll, fhll;
+        if (direction == 1)
+        {
+            uhll = u_hll[1];
+            fhll = f_hll[1];
+        }
+        else //if (direction == 2)
+        {
+            uhll = u_hll[2];
+            fhll = f_hll[2];
+        }
+
+        double a = f_hll[3] + f_hll[0]; // total energy flux
+        double b = -(u_hll[3] + u_hll[0] + fhll);
+        double c = uhll;
+        double v_star; 
+        double vl, vr;
+
+        if (fabs(a) < 1e-10)
+        {
+            v_star = -c / b;
+        }
+        else
+        {
+            v_star = (-b - sqrt(b * b - 4.0 * a * c)) / (2.0 * a);
+        }
+
+        double p_star = -a * v_star + fhll;
+
+        if (v_face < v_star) // in left star state
+        {   
+            vl = primitive_to_beta_component(pl, direction);
+            D_star = ul[0] * (am - vl) / (am - v_star);
+            if (direction == 1)
+            {
+                E_star = (am * (ul[3] + ul[0]) - ul[1] + p_star * v_star) / (am - v_star);
+                S1_star = (E_star + p_star) * v_star;   
+                S2_star = ul[2] * (am - vl) / (am - v_star);
+            }
+            else // if (direction == 2)
+            {
+                E_star = (am * (ul[3] + ul[0]) - ul[2] + p_star * v_star) / (am - v_star);                
+                S1_star = ul[1] * (am - vl) / (am - v_star);
+                S2_star = (E_star + p_star) * v_star;
+            }
+
+            tau_star = E_star - D_star;
+
+            flux[0] = D_star * v_star - v_face * D_star;
+            flux[1] = S1_star * v_star + p_star * (direction == 1) - v_face * S1_star;
+            flux[2] = S2_star * v_star + p_star * (direction == 2) - v_face * S2_star;            
+            
+            if (direction == 1) 
+            {
+                flux[3] = S1_star - D_star * v_star - v_face * tau_star;
+            }
+            else //if (direction == 2)
+            {
+                flux[3] = S2_star - D_star * v_star - v_face * tau_star;
+            }
+        }
+        else // in right star state
+        {
+            vr = primitive_to_beta_component(pr, direction);
+            D_star = ur[0] * (am - vr) / (am - v_star);
+
+            if (direction == 1)
+            {
+                E_star = (am * (ur[3] + ur[0]) - ur[1] + p_star * v_star) / (am - v_star);
+                S1_star = (E_star + p_star) * v_star;   
+                S2_star = ur[2] * (am - vr) / (am - v_star);
+            }
+            else //if (direction == 2)
+            {
+                E_star = (am * (ur[3] + ur[0]) - ur[2] + p_star * v_star) / (am - v_star);                
+                S1_star = ur[1] * (am - vr) / (am - v_star);
+                S2_star = (E_star + p_star) * v_star;
+            }
+
+            tau_star = E_star - D_star;
+
+            flux[0] = D_star * v_star - v_face * D_star;
+            flux[1] = S1_star * v_star + p_star * (direction == 1) - v_face * S1_star;
+            flux[2] = S2_star * v_star + p_star * (direction == 2) - v_face * S2_star;            
+            
+            if (direction == 1) 
+            {
+                flux[3] = S1_star - D_star * v_star - v_face * tau_star;
+            }
+            else //if (direction == 2)
+            {
+                flux[3] = S2_star - D_star * v_star - v_face * tau_star;
+            }
+        }   
+    }
+}
+#endif
 
 // ============================ GEOMETRY ======================================
 // ============================================================================
@@ -361,7 +511,8 @@ PUBLIC void srhd_2d_conserved_to_primitive(
     int ni,
     int nj,
     double *face_positions,  // :: $.shape == (ni + 1,)
-    double *conserved,       // :: $.shape == (ni + 4, nj, 4)
+    double *conserved1,      // :: $.shape == (ni + 4, nj, 4)
+    double *conserved2,      // :: $.shape == (ni + 4, nj, 4)
     double *primitive,       // :: $.shape == (ni + 4, nj, 4)
     double polar_extent,
     double scale_factor)     // :: $ >= 0.0
@@ -375,7 +526,8 @@ PUBLIC void srhd_2d_conserved_to_primitive(
     {
         int n = (i + ng) * si + j * sj;
         double *p = &primitive[n];
-        double *u = &conserved[n];
+        double *u1 = &conserved1[n];
+        double *u2 = &conserved2[n];
         double x0 = face_positions[i];
         double x1 = face_positions[i + 1];
         double r0 = x0 * scale_factor;
@@ -383,7 +535,7 @@ PUBLIC void srhd_2d_conserved_to_primitive(
         double q0 = dq * (j + 0);
         double q1 = dq * (j + 1);
         double dv = cell_volume(r0, r1, q0, q1);
-        conserved_to_primitive(u, p, dv, x0, q0);
+        conserved_to_primitive(u1, u2, p, dv, x0, q0);
     }
 }
 
@@ -440,8 +592,11 @@ PUBLIC void srhd_2d_advance_rk(
     double time,            // current time
     double rk_param,        // runge-kutta parameter
     double dt,              // timestep size
-    int fix_i0,             // don't evolve the first radial zone in the patch
-    int fix_i1)             // don't evolve the final radial zone in the patch
+    double jet_mdot,
+    double jet_gamma_beta,
+    double jet_theta,
+    double jet_duration,
+    int num_first_order_zones)
 {
     int ng = 2; // number of guard zones in the radial direction
     int si = NCONS * nj;
@@ -450,18 +605,25 @@ PUBLIC void srhd_2d_advance_rk(
 
     FOR_EACH_2D(ni, nj)
     {
-        int fixed_zone = (fix_i0 && i == 0) || (fix_i1 && i == ni - 1);
+        double x0 = face_positions[i];
+        double x1 = face_positions[i + 1];
+        double r0 = x0 * (a0 + adot * time);
+        double r1 = x1 * (a0 + adot * time);
+        double q0 = dq * (j + 0);
+        double q1 = dq * (j + 1);
+        double qc = 0.5 * (q0 + q1);
 
-        if (!fixed_zone)
+        if (i == 0 && jet_mdot > 0.0 && qc < jet_theta && time < 1.0 + jet_duration) // assumes the jet starts at t=1.0
         {
-
-            double x0 = face_positions[i];
-            double x1 = face_positions[i + 1];
-            double r0 = x0 * (a0 + adot * time);
-            double r1 = x1 * (a0 + adot * time);
-            double q0 = dq * (j + 0);
-            double q1 = dq * (j + 1);
-
+            double *uwr = &conserved_wr[(i + 0 + ng) * si + (j + 0) * sj];
+            double jet_rho = jet_mdot / (4.0 * PI * r0 * r0 * jet_gamma_beta);
+            double jet_prof = exp(-pow(qc / jet_theta, 4.0));
+            double prim[NCONS] = {jet_rho, jet_gamma_beta * jet_prof, 0.0, 1e-6 * jet_rho};
+            double dv = cell_volume(r0, r1, q0, q1);
+            primitive_to_conserved(prim, uwr, dv);
+        }
+        else
+        {
             double *urk = &conserved_rk[(i + 0 + ng) * si + (j + 0) * sj];
             double *urd = &conserved_rd[(i + 0 + ng) * si + (j + 0) * sj];
             double *uwr = &conserved_wr[(i + 0 + ng) * si + (j + 0) * sj];
@@ -483,24 +645,27 @@ PUBLIC void srhd_2d_advance_rk(
             double pljm[NCONS];
             double prjp[NCONS];
             double prjm[NCONS];
-            double grli[NCONS];
-            double grri[NCONS];
-            double grcc[NCONS];
-            double gqlj[NCONS];
-            double gqrj[NCONS];
-            double gqcc[NCONS];
+            double grli[NCONS] = {0.0};
+            double grri[NCONS] = {0.0};
+            double grcc[NCONS] = {0.0};
+            double gqlj[NCONS] = {0.0};
+            double gqrj[NCONS] = {0.0};
+            double gqcc[NCONS] = {0.0};
             double fli[NCONS];
             double fri[NCONS];
             double flj[NCONS];
             double frj[NCONS];
             double sources[NCONS];
 
-            plm_gradient(pki, pli, pcc, grli);
-            plm_gradient(pli, pcc, pri, grcc);
-            plm_gradient(pcc, pri, pti, grri);
-            plm_gradient(pkj, plj, pcc, gqlj);
-            plm_gradient(plj, pcc, prj, gqcc);
-            plm_gradient(pcc, prj, ptj, gqrj);
+            if (i >= num_first_order_zones)
+            {
+                plm_gradient(pki, pli, pcc, grli);
+                plm_gradient(pli, pcc, pri, grcc);
+                plm_gradient(pcc, pri, pti, grri);
+                plm_gradient(pkj, plj, pcc, gqlj);
+                plm_gradient(plj, pcc, prj, gqcc);
+                plm_gradient(pcc, prj, ptj, gqrj);
+            }
 
             for (int q = 0; q < NCONS; ++q)
             {
@@ -519,10 +684,10 @@ PUBLIC void srhd_2d_advance_rk(
             double da_q0 = face_area(r0, r1, q0, q0);
             double da_q1 = face_area(r0, r1, q1, q1);
 
-            riemann_hlle(plim, plip, x0 * adot, fli, 1);
-            riemann_hlle(prim, prip, x1 * adot, fri, 1);
-            riemann_hlle(pljm, pljp, 0.0, flj, 2);
-            riemann_hlle(prjm, prjp, 0.0, frj, 2);
+            riemann_hllc(plim, plip, x0 * adot, fli, 1);
+            riemann_hllc(prim, prip, x1 * adot, fri, 1);
+            riemann_hllc(pljm, pljp, 0.0, flj, 2);
+            riemann_hllc(prjm, prjp, 0.0, frj, 2);
             geometric_source_terms(r0, r1, q0, q1, pcc, sources);
 
             for (int q = 0; q < NCONS; ++q)

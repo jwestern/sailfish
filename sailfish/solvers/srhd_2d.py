@@ -27,11 +27,14 @@ logger = getLogger(__name__)
 NUM_GUARD = 2
 NUM_CONS = 4
 
-BC_PERIODIC = 0
-BC_OUTFLOW = 1
-BC_INFLOW = 2
-BC_REFLECT = 3
-BC_FIXED = 4
+BC_INTERNAL = 0  # internal BC (guard zones overlap a neighbor patch)
+BC_PERIODIC = 1  # period BC (not handled in C)
+BC_OUTFLOW = 2  # zero-gradient BC (not handled in C)
+BC_INFLOW = 3  # user-supplied BC in guard zones (not handled in C)
+BC_REFLECT = 4  # apply reflecting BC in guard zones (not handled in C)
+BC_FIXED = 5  # don't evolve the first (or last) interior zones
+BC_JET = 6  # use a jet inflow boundary condition, with supplied parameters
+
 
 BC_DICT = {
     "periodic": BC_PERIODIC,
@@ -39,6 +42,7 @@ BC_DICT = {
     "inflow": BC_INFLOW,
     "reflect": BC_REFLECT,
     "fixed": BC_FIXED,
+    "jet": BC_JET,
 }
 
 
@@ -58,10 +62,14 @@ def initial_condition(setup, mesh, i0, i1, j0, j1, time, xp):
 class Options(NamedTuple):
     compute_wavespeed: bool = False
     rk_order: int = 2
+    plm_theta: float = 1.5
 
 
 class Physics(NamedTuple):
-    pass
+    jet_mdot: float = 0.0
+    jet_gamma_beta: float = 0.0
+    jet_theta: float = 0.0
+    jet_duration: float = 0.0
 
 
 class Patch:
@@ -75,12 +83,12 @@ class Patch:
     def __init__(
         self,
         setup,
+        physics,
         time,
         conserved,
         mesh,
         index_range,
-        fix_i0,
-        fix_i1,
+        num_first_order_zones,
         lib,
         xp,
         execution_context,
@@ -91,9 +99,9 @@ class Patch:
         nj = mesh.shape[1]
         self.lib = lib
         self.xp = xp
+        self.physics = physics
         self.index_range = index_range
-        self.fix_i0 = fix_i0
-        self.fix_i1 = fix_i1
+        self.num_first_order_zones = num_first_order_zones
         self.shape = shape = (i1 - i0, mesh.shape[1])  # not including guard zones
         self.polar_extent = mesh.polar_extent
         self.time = self.time0 = time
@@ -138,10 +146,12 @@ class Patch:
             self.lib.srhd_2d_conserved_to_primitive[self.shape](
                 self.faces,
                 self.conserved1,
+                self.conserved2,
                 self.primitive1,
                 self.polar_extent,
                 self.scale_factor,
             )
+            self.conserved1, self.conserved2 = self.conserved2, self.conserved1
 
     def advance_rk(self, rk_param, dt):
         with self.execution_context:
@@ -157,8 +167,11 @@ class Patch:
                 self.time,
                 rk_param,
                 dt,
-                int(self.fix_i0),
-                int(self.fix_i1),
+                self.physics.jet_mdot if self.index_range[0] == 0 else 0.0,
+                self.physics.jet_gamma_beta,
+                self.physics.jet_theta,
+                self.physics.jet_duration,
+                self.num_first_order_zones,
             )
         self.time = self.time0 * rk_param + (self.time + dt) * (1.0 - rk_param)
         self.conserved1, self.conserved2 = self.conserved2, self.conserved1
@@ -211,11 +224,16 @@ class Solver(SolverBase):
         with open(__file__.replace(".py", ".c")) as f:
             code = f.read()
 
-        xp = get_array_module(mode)
-        lib = Library(code, mode=mode, debug=False)
-
         self._physics = physics = Physics(**physics)
         self._options = options = Options(**options)
+
+        xp = get_array_module(mode)
+        lib = Library(
+            code,
+            mode=mode,
+            debug=False,
+            define_macros=dict(PLM_THETA=options.plm_theta),
+        )
 
         try:
             bcl, bcr = setup.boundary_condition
@@ -237,16 +255,20 @@ class Solver(SolverBase):
         patches = list()
 
         for n, (a, b) in enumerate(subdivide(mesh.shape[0], num_patches)):
-            fix_i0 = self.boundary_condition[0] == BC_FIXED and n == 0
-            fix_i1 = self.boundary_condition[1] == BC_FIXED and n == num_patches - 1
+            if n == 0 and bcl == "jet":
+                # introduction of some extra diffusion near the jet inlet is
+                # effective at preventing crashes
+                num_first_order_zones = 4
+            else:
+                num_first_order_zones = 0
             patch = Patch(
                 setup,
+                physics,
                 time,
                 solution[a:b] if solution is not None else None,
                 mesh,
                 (a, b),
-                fix_i0,
-                fix_i1,
+                num_first_order_zones,
                 lib,
                 xp,
                 execution_context(mode, device_id=n % num_devices(mode)),
@@ -350,7 +372,7 @@ class Solver(SolverBase):
                 return [p[0], -p[1], p[2], p[3]]
 
             if patch_index == 0:
-                if bcl == BC_OUTFLOW:
+                if bcl == BC_OUTFLOW or bcl == BC_JET:
                     pc[:+ng] = pc[+ng : +2 * ng]
                 elif bcl == BC_INFLOW:
                     for i in range(-ng, 0):

@@ -148,6 +148,8 @@ def write_checkpoint(number, outdir, state):
     state_checkpoint_dict = dict(
         iteration=state.iteration,
         time=state.solver.time,
+        timestep_dt=state.timestep_dt,
+        cfl_number=state.cfl_number,
         solution=state.solver.solution,
         primitive=state.solver.primitive,
         timeseries=state.timeseries,
@@ -252,6 +254,8 @@ class DriverState(NamedTuple):
     event_states: list
     solver: SolverBase
     setup: Setup
+    cfl_number: float
+    timestep_dt: float
 
 
 def simulate(driver):
@@ -267,7 +271,6 @@ def simulate(driver):
     """
 
     from time import perf_counter
-    from logging import getLogger, basicConfig, StreamHandler, Formatter, INFO
     from sailfish import __version__ as version
     from sailfish.kernel.system import configure_build, log_system_info, measure_time
     from sailfish.event import Recurrence
@@ -304,6 +307,7 @@ def simulate(driver):
         event_states = {name: RecurringEvent() for name in driver.events}
         solution = None
         timeseries = list()
+        dt = None
 
     elif driver.chkpt_file:
         """
@@ -335,6 +339,26 @@ def simulate(driver):
         time = chkpt["time"]
         event_states = chkpt["event_states"]
         solution = chkpt["solution"]
+
+        try:
+            dt = chkpt["timestep_dt"]
+        except KeyError:
+            # Forgive missing timestep_dt in the checkpoint, this key was
+            # added recently (JZ 4-25-22). Prior to this change, timestep_dt
+            # was not stored in the checkpoint file, and a restarted
+            # simulation could end up different from a continuous one, when:
+            # (1) new_timestep_cadence > 1, and (2) a new dt was not computed
+            # just before the checkpoint was written. The differences would be
+            # due to a slightly different timestep used, after it's recomputed
+            # following the restart, and they would be minor. Still, restarted
+            # runs are supposed to be bitwise identical continuous ones. Older
+            # checkpoints will still work, but they will not have this
+            # guarantee.
+            logger.warning(
+                "timestep_dt not in checkpoint, will recompute it on first iteration"
+            )
+            dt = None
+
         try:
             timeseries = chkpt["timeseries"]
         except KeyError:
@@ -353,6 +377,7 @@ def simulate(driver):
     end_time = first_not_none(driver.end_time, setup.default_end_time, float("inf"))
     reference_time = setup.reference_time_scale
     new_timestep_cadence = driver.new_timestep_cadence or 1
+    dt = None
 
     solver = make_solver(
         setup.solver,
@@ -397,13 +422,15 @@ def simulate(driver):
             event_states=event_states,
             solver=solver,
             setup=setup,
+            cfl_number=cfl_number,
+            timestep_dt=dt,
         )
 
     while True:
         siml_time = solver.time
         user_time = siml_time / reference_time
 
-        if end_time is not None and user_time > end_time:
+        if end_time is not None and user_time >= end_time:
             break
 
         """
@@ -416,11 +443,11 @@ def simulate(driver):
             state = event_states[name]
             if event_states[name].is_due(user_time, event):
                 event_states[name] = state.next(user_time, event)
-                yield name, state.number, grab_state(**dict())
+                yield name, state.number, grab_state()
 
         with measure_time() as fold_time:
             for _ in range(fold):
-                if iteration % new_timestep_cadence == 0:
+                if dt is None or (iteration % new_timestep_cadence == 0):
                     dx = mesh.min_spacing(siml_time)
                     dt = dx / solver.maximum_wavespeed() * cfl_number
                 solver.advance(dt)
@@ -431,7 +458,7 @@ def simulate(driver):
             f"[{iteration:04d}] t={user_time:0.3f} dt={dt:.3e} Mzps={Mzps:.3f}"
         )
 
-    yield "end", None, grab_state(**dict())
+    yield "end", None, grab_state()
 
 
 def run(setup_name, quiet=True, **kwargs):
@@ -472,6 +499,7 @@ def init_logging():
     function will do it for you. Note this function is also invoked by the
     `run` function if :code:`quiet=False` is passed to it.
     """
+    from sys import stdout
     from logging import StreamHandler, Formatter, getLogger, INFO
 
     class RunFormatter(Formatter):
@@ -485,7 +513,7 @@ def init_logging():
             else:
                 return f"[{name}:{record.levelname.lower()}] {record.msg}"
 
-    handler = StreamHandler()
+    handler = StreamHandler(stdout)
     handler.setFormatter(RunFormatter())
 
     root_logger = getLogger()
@@ -509,23 +537,29 @@ def load_user_config():
         config = ConfigParser()
         config.read(".sailfish")
 
-        for setup_extension in config["extensions"]["setups"].split():
-            import_module(setup_extension)
+        try:
+            for setup_extension in config["extensions"]["setups"].split():
+                import_module(setup_extension)
+        except KeyError:
+            pass
 
-        for solver_extension in config["extensions"]["solvers"].split():
-            register_solver_extension(solver_extension)
+        try:
+            for solver_extension in config["extensions"]["solvers"].split():
+                register_solver_extension(solver_extension)
+        except KeyError:
+            pass
 
-        for key, val in config["build"].items():
-            user_build_config[key] = val
+        try:
+            for key, val in config["build"].items():
+                user_build_config[key] = val
+        except KeyError:
+            pass
 
     except ModuleNotFoundError as e:
         raise ExtensionError(e)
 
     except ParsingError as e:
         raise ConfigurationError(e)
-
-    except KeyError:
-        pass
 
 
 def main():
@@ -657,6 +691,12 @@ def main():
         type=float,
         help="when to end the simulation",
     )
+    parser.add_argument(
+        "--event-handlers-file",
+        metavar="F",
+        type=str,
+        help="path to a module defining a get_event_handlers function",
+    )
     exec_group = parser.add_mutually_exclusive_group()
     exec_group.add_argument(
         "--mode",
@@ -703,6 +743,19 @@ def main():
                 or (driver.chkpt_file and os.path.dirname(driver.chkpt_file))
                 or "."
             )
+
+            if args.event_handlers_file is not None:
+                import importlib.util
+
+                spec = importlib.util.spec_from_file_location(
+                    "events_handler_module", args.event_handlers_file
+                )
+                events_handler_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(events_handler_module)
+                events_dict = events_handler_module.get_event_handlers()
+            else:
+                events_dict = dict()
+
             for name, number, state in simulate(driver):
                 if name == "timeseries":
                     append_timeseries(state)
@@ -710,6 +763,8 @@ def main():
                     write_checkpoint(number, outdir, state)
                 elif name == "end":
                     write_checkpoint("final", outdir, state)
+                elif name in events_dict:
+                    events_dict[name](number, outdir, state, logger)
                 else:
                     logger.warning(f"unrecognized event {name}")
 
