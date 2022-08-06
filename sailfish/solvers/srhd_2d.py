@@ -63,6 +63,7 @@ class Options(NamedTuple):
     compute_wavespeed: bool = False
     rk_order: int = 2
     plm_theta: float = 1.5
+    mach_ceiling: float = 1e6
 
 
 class Physics(NamedTuple):
@@ -232,7 +233,10 @@ class Solver(SolverBase):
             code,
             mode=mode,
             debug=False,
-            define_macros=dict(PLM_THETA=options.plm_theta),
+            define_macros=dict(
+                PLM_THETA=options.plm_theta,
+                MACH_CEILING=options.mach_ceiling,
+            ),
         )
 
         try:
@@ -372,7 +376,7 @@ class Solver(SolverBase):
                 return [p[0], -p[1], p[2], p[3]]
 
             if patch_index == 0:
-                if bcl == BC_OUTFLOW or bcl == BC_JET:
+                if bcl == BC_OUTFLOW:
                     pc[:+ng] = pc[+ng : +2 * ng]
                 elif bcl == BC_INFLOW:
                     for i in range(-ng, 0):

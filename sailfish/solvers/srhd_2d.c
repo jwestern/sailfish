@@ -14,6 +14,10 @@ DESCRIPTION:
 #define ADIABATIC_GAMMA (4.0 / 3.0)
 #define PI 3.141592653589793
 
+#ifndef MACH_CEILING
+#define MACH_CEILING 1e6
+#endif
+
 #ifndef RIEMANN_SOLVER
 #define RIEMANN_SOLVER 1 // 0=HLLE 1=HLLC
 #endif
@@ -142,7 +146,7 @@ PRIVATE void conserved_to_primitive(double *cons1, double *cons2, double *prim, 
     prim[3] = p;
     // prim[4] = cons1[4] / cons1[0];
 
-    double mach_ceiling = 1e6;
+    double mach_ceiling = MACH_CEILING;
     double u_squared = prim[1] * prim[1] + prim[2] * prim[2];
     double e = prim[3] / prim[0] * 3.0;
     double emin = u_squared / (1.0 + u_squared) / pow(mach_ceiling, 2.0);
@@ -613,14 +617,18 @@ PUBLIC void srhd_2d_advance_rk(
         double q1 = dq * (j + 1);
         double qc = 0.5 * (q0 + q1);
 
-        if (i == 0 && jet_mdot > 0.0 && qc < jet_theta && time < 1.0 + jet_duration) // assumes the jet starts at t=1.0
+        if (i == 0 && jet_mdot > 0.0 && qc < jet_theta * 2.0 && time < 1.0 + jet_duration) // assumes the jet starts at t=1.0
         {
             double *uwr = &conserved_wr[(i + 0 + ng) * si + (j + 0) * sj];
             double jet_rho = jet_mdot / (4.0 * PI * r0 * r0 * jet_gamma_beta);
-            double jet_prof = exp(-pow(qc / jet_theta, 4.0));
+            double jet_prof = exp(-pow(qc / jet_theta, 2.0));
             double prim[NCONS] = {jet_rho, jet_gamma_beta * jet_prof, 0.0, 1e-6 * jet_rho};
             double dv = cell_volume(r0, r1, q0, q1);
             primitive_to_conserved(prim, uwr, dv);
+        }
+        else if (jet_mdot > 0.0 && i == 0) // if the jet is enabled, then fix the innermost zone
+        {
+
         }
         else
         {

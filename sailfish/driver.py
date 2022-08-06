@@ -138,8 +138,10 @@ def write_checkpoint(number, outdir, state):
     """
     if type(number) is int:
         filename = f"chkpt.{number:04d}.pk"
+    elif type(number) is str:
+        filename = f"chkpt.{number}.pk"
     else:
-        filename = f"chkpt.final.pk"
+        raise ValueError("number arg must be int or str")
 
     if outdir is not None:
         pathlib.Path(outdir).mkdir(parents=True, exist_ok=True)
@@ -179,6 +181,22 @@ def load_checkpoint(chkpt_file):
         raise ConfigurationError(f"could not open checkpoint file {chkpt_file}")
 
 
+def newest_chkpt_in_directory(directory_name):
+    import re
+
+    expr = re.compile("chkpt\.([0-9]+)\.pk")
+    list_of_matches = list(
+        filter(None, (expr.search(f) for f in os.listdir(directory_name)))
+    )
+    list_of_matches.sort(key=lambda l: int(l.groups()[0]))
+    try:
+        return os.path.join(directory_name, list_of_matches[-1].group())
+    except IndexError:
+        raise ConfigurationError(
+            "the specified directory did not have usable checkpoints"
+        )
+
+
 def append_timeseries(state):
     """
     Append to the driver state timeseries for post-processing.
@@ -209,6 +227,7 @@ class DriverArgs(NamedTuple):
     num_patches: int = None
     events: Dict[str, Recurrence] = dict()
     new_timestep_cadence: int = None
+    verbose_output: str = ""
 
     def from_namespace(args):
         """
@@ -219,12 +238,15 @@ class DriverArgs(NamedTuple):
         )
         parts = args.command.split(":")
 
-        if not parts[0].endswith(".pk"):
-            setup_name = parts[0]
-            chkpt_file = None
-        else:
+        if args.restart_dir:
+            setup_name = None
+            chkpt_file = newest_chkpt_in_directory(parts[0])
+        elif parts[0].endswith(".pk"):
             setup_name = None
             chkpt_file = parts[0]
+        else:
+            setup_name = parts[0]
+            chkpt_file = None
 
         try:
             model_parameters = dict(keyed_value(a) for a in parts[1:])
@@ -379,6 +401,15 @@ def simulate(driver):
     new_timestep_cadence = driver.new_timestep_cadence or 1
     dt = None
 
+    if "physics" in driver.verbose_output:
+        logger.info(f"physics struct (setup -> solver) {setup.physics}")
+    if (
+        "options" in driver.verbose_output
+        or "solver" in driver.verbose_output
+        or "solver-options" in driver.verbose_output
+    ):
+        logger.info(f"options struct (cmdline -> solver) {driver.solver_options}")
+
     solver = make_solver(
         setup.solver,
         setup.physics,
@@ -430,9 +461,6 @@ def simulate(driver):
         siml_time = solver.time
         user_time = siml_time / reference_time
 
-        if end_time is not None and user_time >= end_time:
-            break
-
         """
         Run the main simulation loop. Iterations are grouped according the
         the fold parameter. Side effects including the iteration message are
@@ -444,6 +472,9 @@ def simulate(driver):
             if event_states[name].is_due(user_time, event):
                 event_states[name] = state.next(user_time, event)
                 yield name, state.number, grab_state()
+
+        if end_time is not None and user_time >= end_time:
+            break
 
         with measure_time() as fold_time:
             for _ in range(fold):
@@ -588,7 +619,7 @@ def main():
     parser.add_argument(
         "command",
         nargs="?",
-        help="setup name or restart file",
+        help="setup name or restart file (if directory, then load newest checkpoint)",
     )
     parser.add_argument(
         "--describe",
@@ -637,6 +668,16 @@ def main():
         action=MakeDict,
         default=dict(),
         help="a sequence of events and recurrence rules to be emitted",
+    )
+    parser.add_argument(
+        "--restart-dir",
+        action="store_true",
+        help="the command argument is a directory; restart from newest checkpoint therein",
+    )
+    parser.add_argument(
+        "--final-chkpt",
+        action="store_true",
+        help="write chkpt.final.pk on exit",
     )
     parser.add_argument(
         "--checkpoint",
@@ -696,6 +737,13 @@ def main():
         metavar="F",
         type=str,
         help="path to a module defining a get_event_handlers function",
+    )
+    parser.add_argument(
+        "--verbose-output",
+        metavar="P",
+        type=str,
+        default="",
+        help="detailed print solver structs [physics,options]",
     )
     exec_group = parser.add_mutually_exclusive_group()
     exec_group.add_argument(
@@ -762,7 +810,8 @@ def main():
                 elif name == "checkpoint":
                     write_checkpoint(number, outdir, state)
                 elif name == "end":
-                    write_checkpoint("final", outdir, state)
+                    if args.final_chkpt:
+                        write_checkpoint("final", outdir, state)
                 elif name in events_dict:
                     events_dict[name](number, outdir, state, logger)
                 else:
