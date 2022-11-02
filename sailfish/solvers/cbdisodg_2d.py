@@ -8,7 +8,7 @@ from sailfish.kernel.library import Library
 from sailfish.kernel.system import get_array_module, execution_context, num_devices
 from sailfish.mesh import PlanarCartesian2DMesh
 from sailfish.physics.circumbinary import Physics, EquationOfState, ViscosityModel
-from sailfish.solver import SolverBase
+from sailfish.solver_base import SolverBase
 from sailfish.subdivide import subdivide, concat_on_host, lazy_reduce
 
 
@@ -426,11 +426,11 @@ class Solver(SolverBase):
         """
         Generate runtime reductions on the solution data for time series.
 
-        As of now, the reductions generated are the rates of mass accretion,
-        and of x and y momentum (combined gravitational and accretion)
-        resulting from each of the point masses. If there are 2 point masses,
-        then the result of this function is a 7-element list: :pyobj:`[time,
-        mdot1, fx1, fy1, mdot2, fx2, fy2]`.
+        As of now, the reductions generated are the rates of mass accretion, and
+        of x and y momentum (combined gravitational and accretion) resulting
+        from each of the point masses. If there are 2 point masses, then the
+        result of this function is a 7-element list: `[time, mdot1, fx1, fy1,
+        mdot2, fx2, fy2]`.
         """
 
         def to_host(a):

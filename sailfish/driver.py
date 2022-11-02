@@ -6,8 +6,8 @@ import os, pickle, pathlib
 from typing import NamedTuple, Dict
 from logging import getLogger
 from sailfish.event import Recurrence, RecurringEvent, ParseRecurrenceError
-from sailfish.setup import Setup, SetupError
-from sailfish.solver import SolverBase
+from sailfish.setup_base import SetupBase, SetupError
+from sailfish.solver_base import SolverBase
 from sailfish.solvers import (
     SolverInitializationError,
     register_solver_extension,
@@ -27,11 +27,19 @@ class ExtensionError(Exception):
 
 
 def keyed_event(item):
+    """
+    Return a key, val pair where the value string describes a recurrence rule.
+    """
     key, val = item.split("=")
     return key, Recurrence.from_str(val)
 
 
 def keyed_value(item):
+    """
+    Return a key, val pair from a "key=val" string.
+
+    The value string is python-eval'd so it must be a valid Python expression.
+    """
     try:
         key, val = item.split("=")
         return key, eval(val)
@@ -189,22 +197,29 @@ def newest_chkpt_in_directory(directory_name):
         filter(None, (expr.search(f) for f in os.listdir(directory_name)))
     )
     list_of_matches.sort(key=lambda l: int(l.groups()[0]))
-    try:
-        return os.path.join(directory_name, list_of_matches[-1].group())
-    except IndexError:
-        raise ConfigurationError(
-            "the specified directory did not have usable checkpoints"
-        )
+
+    for match in reversed(list_of_matches):
+        try:
+            path = os.path.join(directory_name, match.group())
+            load_checkpoint(path)  # exception if checkpoint is corrupted
+            return path
+        except:
+            logger.warning(f"skipping corrupt checkpoint file {path}")
+
+    raise ConfigurationError("the specified directory did not have a usable checkpoint")
 
 
 def append_timeseries(state):
     """
     Append to the driver state timeseries for post-processing.
     """
-    try:
-        state.timeseries.append(state.solver.reductions())
+
+    reductions = state.solver.reductions()
+
+    if reductions:
+        state.timeseries.append(reductions)
         logger.info(f"record timeseries event {len(state.timeseries)}")
-    except AttributeError:
+    else:
         logger.warning(
             "timeseries event ignored because solver does not provide reductions"
         )
@@ -263,10 +278,10 @@ class DriverArgs(NamedTuple):
 
 class DriverState(NamedTuple):
     """
-    Contains the stateful variables in use by the :pyobj:`simulate` function.
+    Contains the stateful variables in use by the `simulate` function.
 
-    An instance of this class is yielded by :pyobj:`simulate` each time an
-    event takes place.
+    An instance of this class is yielded by `simulate` each time an event takes
+    place.
     """
 
     iteration: int
@@ -275,7 +290,7 @@ class DriverState(NamedTuple):
     timeseries: list
     event_states: list
     solver: SolverBase
-    setup: Setup
+    setup: SetupBase
     cfl_number: float
     timestep_dt: float
 
@@ -291,7 +306,6 @@ def simulate(driver):
     This function is a generator: it yields its state at a sequence of
     pause points, defined by the `events` dictionary.
     """
-
     from time import perf_counter
     from sailfish import __version__ as version
     from sailfish.kernel.system import configure_build, log_system_info, measure_time
@@ -301,23 +315,14 @@ def simulate(driver):
     main_logger = getLogger("main_logger")
     main_logger.info(f"\nsailfish {version}\n")
 
-    """
-    Initialize and log state in the the system module. The build system
-    influences JIT-compiled module code. Currently the build parameters are
-    inferred from the platform (Linux or MacOS), but in the future these
-    should also be extensible by a system-specific rc-style configuration
-    file.
-    """
-    configure_build(**user_build_config)
-    log_system_info(driver.execution_mode or "cpu")
-
     if driver.setup_name:
         """
         Generate an initial driver state from command line arguments, model
         parametrs, and a setup instance.
         """
+
         logger.info(f"start new simulation with setup {driver.setup_name}")
-        setup = Setup.find_setup_class(driver.setup_name)(
+        setup = SetupBase.find_setup_class(driver.setup_name)(
             **driver.model_parameters or dict()
         )
         driver = driver._replace(
@@ -335,13 +340,13 @@ def simulate(driver):
         """
         Load driver state from a checkpoint file. The setup model parameters
         are updated with any items given on the command line after the setup
-        name. All command line arguments are also restorted from the
-        previous session, but are updated with the command line argument
-        given for this session, except for "frozen" arguments.
+        name. All command line arguments are also restorted from the previous
+        session, but are updated with the command line argument given for this
+        session, except for "frozen" arguments.
         """
         logger.info(f"load checkpoint {driver.chkpt_file}")
         chkpt = load_checkpoint(driver.chkpt_file)
-        setup_class = Setup.find_setup_class(chkpt["setup_name"])
+        setup_class = SetupBase.find_setup_class(chkpt["setup_name"])
         driver = update_where_none(driver, chkpt["driver"], frozen=["resolution"])
 
         update_dict_where_none(
@@ -373,8 +378,8 @@ def simulate(driver):
             # just before the checkpoint was written. The differences would be
             # due to a slightly different timestep used, after it's recomputed
             # following the restart, and they would be minor. Still, restarted
-            # runs are supposed to be bitwise identical continuous ones. Older
-            # checkpoints will still work, but they will not have this
+            # runs are supposed to be bitwise identical to continuous ones.
+            # Older checkpoints will still work, but they will not have this
             # guarantee.
             logger.warning(
                 "timestep_dt not in checkpoint, will recompute it on first iteration"
@@ -392,6 +397,28 @@ def simulate(driver):
 
     else:
         raise ConfigurationError("driver args must specify setup_name or chkpt_file")
+
+    """
+    This line ensures that if a checkpoint event is present, then it is
+    emitted last, ensuring that any modifications to the driver state (e.g.
+    time series sample) happening in response to other events triggered in the
+    same iteration, are reflected in the checkpoint file that is written.
+
+    Note: The Python 3.7+ specifications guarantee to that dictionary
+    iteration order reflects the insertion order. This behavior is also
+    present in the CPython implementation of Python 3.6
+    """
+    if "checkpoint" in event_states:
+        event_states["checkpoint"] = event_states.pop("checkpoint")
+
+    """
+    Initialize and log state in the system module. The build system influences
+    JIT-compiled module code. Currently the build parameters are inferred from
+    the platform (Linux or MacOS), but in the future these should also be
+    extensible by a system-specific rc-style configuration file.
+    """
+    configure_build(**user_build_config, execution_mode=driver.execution_mode)
+    log_system_info(driver.execution_mode or "cpu")
 
     mode = driver.execution_mode or "cpu"
     fold = driver.fold or 10
@@ -467,7 +494,8 @@ def simulate(driver):
         performed between fold boundaries.
         """
 
-        for name, event in driver.events.items():
+        for name in event_states:
+            event = driver.events[name]
             state = event_states[name]
             if event_states[name].is_due(user_time, event):
                 event_states[name] = state.next(user_time, event)
@@ -476,7 +504,7 @@ def simulate(driver):
         if end_time is not None and user_time >= end_time:
             break
 
-        with measure_time() as fold_time:
+        with measure_time(mode) as fold_time:
             for _ in range(fold):
                 if dt is None or (iteration % new_timestep_cadence == 0):
                     dx = mesh.min_spacing(siml_time)
@@ -556,10 +584,10 @@ def load_user_config():
     """
     Initialize user extensions: setups and solvers outside the main codebase.
 
-    This function is called by the :pyobj:`main` entry point and the
-    :pyobj:`run` API function to load custom setups provided by the user.
-    Extensions are defined in the `extensions` section of the .sailfish
-    file. The .sailfish file is loaded from the current working directory.
+    This function is called by the `main` entry point and the `run` API function
+    to load custom setups provided by the user. Extensions are defined in the
+    `extensions` section of the .sailfish file. The .sailfish file is loaded
+    from the current working directory.
     """
     from configparser import ConfigParser, ParsingError
     from importlib import import_module
@@ -598,6 +626,7 @@ def main():
     General-purpose command line interface.
     """
     import argparse
+    import sailfish
     import sailfish.setups
 
     class MakeDict(argparse.Action):
@@ -614,7 +643,12 @@ def main():
     parser = argparse.ArgumentParser(
         prog="sailfish",
         usage=argparse.SUPPRESS,
-        description="sailfish is a gpu-accelerated astrophysical gasdynamics code",
+        description="sailfish is a GPU-accelerated astrophysical gasdynamics code",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {sailfish.__version__}",
     )
     parser.add_argument(
         "command",
@@ -777,11 +811,11 @@ def main():
 
         if args.describe and args.command is not None:
             setup_name = args.command.split(":")[0]
-            Setup.find_setup_class(setup_name).describe_class()
+            SetupBase.find_setup_class(setup_name).describe_class()
 
         elif args.command is None:
             print("specify setup:")
-            for setup in Setup.__subclasses__():
+            for setup in SetupBase.__subclasses__():
                 print(f"    {setup.dash_case_class_name()}")
 
         else:

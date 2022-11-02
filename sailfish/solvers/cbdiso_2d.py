@@ -13,7 +13,7 @@ from sailfish.physics.circumbinary import (
     ViscosityModel,
     Diagnostic,
 )
-from sailfish.solver import SolverBase
+from sailfish.solver_base import SolverBase
 from sailfish.subdivide import subdivide, to_host, concat_on_host, lazy_reduce
 
 
@@ -108,11 +108,6 @@ class Patch:
         the application of gravitational and/or accretion source terms due to
         point masses.
         """
-        if which_mass == "both":
-            udot1 = self.point_mass_source_term(1, gravity=gravity, accretion=accretion)
-            udot2 = self.point_mass_source_term(2, gravity=gravity, accretion=accretion)
-            return udot1 + udot2
-
         ng = 2  # number of guard cells
         if which_mass not in (1, 2):
             raise ValueError("which_mass must be either 1 or 2")
@@ -131,9 +126,9 @@ class Patch:
                 m.position_y,
                 m.velocity_x,
                 m.velocity_y,
-                m.mass * float(gravity),
+                m.mass * gravity,
                 m.softening_length,
-                m.sink_rate * float(accretion),
+                m.sink_rate * accretion,
                 m.sink_radius,
                 m.sink_model.value,
                 self.primitive1,
@@ -404,6 +399,12 @@ class Solver(SolverBase):
             if quantity == "mdot":
                 return get_field(patch, 0, cut, mass, gravity, accretion)
 
+            if quantity == "fx":
+                return get_field(patch, 1, cut, mass, gravity, accretion)
+
+            if quantity == "fy":
+                return get_field(patch, 2, cut, mass, gravity, accretion)
+
             if quantity == "torque":
                 fx = get_field(patch, 1, cut, mass, gravity, accretion)
                 fy = get_field(patch, 2, cut, mass, gravity, accretion)
@@ -425,6 +426,30 @@ class Solver(SolverBase):
                 ex = (v_dot_v * x - v_dot_r * vx) / GM - x / r
                 ey = (v_dot_v * y - v_dot_r * vy) / GM - y / r
                 return sigma * (ex + 1.0j * ey)
+
+            if quantity == "angular_momentum":
+                sigma = apply_radial_cut(patch.primitive[ng:-ng, ng:-ng, 0])
+                vx = apply_radial_cut(patch.primitive[ng:-ng, ng:-ng, 1])
+                vy = apply_radial_cut(patch.primitive[ng:-ng, ng:-ng, 2])
+                return sigma * (x * vy - y * vx)
+
+            if quantity == "mass":
+                sigma = apply_radial_cut(patch.primitive[ng:-ng, ng:-ng, 0])
+                return sigma
+
+            if quantity == "power":
+                fx = get_field(patch, 1, cut, mass, gravity, accretion)
+                fy = get_field(patch, 2, cut, mass, gravity, accretion)
+                if mass == 1:
+                    m1, m2 = self._physics.point_masses(self.time)
+                    vx1, vy1 = m1.velocity_x, m1.velocity_y
+                    return vx1 * fx + vy1 * fy
+                elif mass == 2:
+                    m1, m2 = self._physics.point_masses(self.time)
+                    vx2, vy2 = m2.velocity_x, m2.velocity_y
+                    return vx2 * fx + vy2 * fy
+                else:
+                    raise ValueError("Mass option for 'power' must be 1 or 2.")
 
             q = quantity
             i = self.patches.index(patch)
